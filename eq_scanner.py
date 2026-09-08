@@ -20,6 +20,7 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 
 import aiohttp
+import aiohttp.web
 
 # ============================================================
 # НАСТРОЙКИ
@@ -60,6 +61,9 @@ logging.basicConfig(
     datefmt="%Y-%m-%d %H:%M:%S",
 )
 log = logging.getLogger("eq")
+
+# Метка бана по IP (418) — чтобы не вешать пересчёт на час
+ban_flag = {"until": 0.0}
 
 
 # ============================================================
@@ -149,15 +153,26 @@ async def fetch_klines(
     params = {"symbol": symbol, "interval": KLINE_INTERVAL, "limit": KLINE_LIMIT}
 
     async with sem:
+        if time.time() < ban_flag["until"]:
+            return None
+
         for attempt in range(retries):
             try:
                 async with session.get(
                     url, params=params, timeout=aiohttp.ClientTimeout(total=20)
                 ) as r:
-                    if r.status in (429, 418):
+                    if r.status in (418, 451):
+                        wait = int(r.headers.get("Retry-After", "3600"))
+                        ban_flag["until"] = time.time() + wait
+                        log.error(
+                            "IP заблокирован (%s) на %ss — пересчёт прерван",
+                            r.status, wait,
+                        )
+                        return None
+                    if r.status == 429:
                         wait = int(r.headers.get("Retry-After", "60"))
-                        log.warning("%s: rate limit %s, пауза %ss", symbol, r.status, wait)
-                        await asyncio.sleep(wait)
+                        log.warning("%s: 429, пауза %ss", symbol, wait)
+                        await asyncio.sleep(min(wait, 60))
                         continue
                     r.raise_for_status()
                     rows = await r.json()
@@ -398,6 +413,21 @@ def seconds_until_next_daily_close() -> float:
     return max((nxt - now).total_seconds(), 60)
 
 
+async def retry_until_ready(session: aiohttp.ClientSession):
+    """Если уровней нет (бан IP / сбой), пробует пересчитать раз в час."""
+    while True:
+        await asyncio.sleep(3600)
+        if levels:
+            continue
+        log.info("Повторная попытка пересчёта EQ")
+        await refresh_levels(session)
+        if levels:
+            await send_telegram(
+                session,
+                f"<b>EQ Scanner: уровни получены</b>\nСимволов: {len(levels)}",
+            )
+
+
 async def refresh_scheduler(session: aiohttp.ClientSession):
     while True:
         wait = seconds_until_next_daily_close()
@@ -407,32 +437,80 @@ async def refresh_scheduler(session: aiohttp.ClientSession):
 
 
 # ============================================================
+# KEEPALIVE (для Render Web Service + UptimeRobot)
+# ============================================================
+
+async def keepalive_server():
+    """Минимальный HTTP-эндпоинт: держит Web Service живым и показывает статус."""
+    port = int(os.getenv("PORT", "10000"))
+
+    async def handler(request):
+        ban_left = max(0, int(ban_flag["until"] - time.time()))
+        body = (
+            f"ok\n"
+            f"levels: {len(levels)}\n"
+            f"interval: {KLINE_INTERVAL}\n"
+            f"pivot: {PIVOT_LEFT}/{PIVOT_RIGHT}\n"
+            f"ip_ban_left: {ban_left}s\n"
+        )
+        return aiohttp.web.Response(text=body, content_type="text/plain")
+
+    app = aiohttp.web.Application()
+    app.router.add_get("/", handler)
+    app.router.add_get("/health", handler)
+    runner = aiohttp.web.AppRunner(app)
+    await runner.setup()
+    await aiohttp.web.TCPSite(runner, "0.0.0.0", port).start()
+    log.info("Keepalive слушает порт %s", port)
+
+
+# ============================================================
 # MAIN
 # ============================================================
 
 async def main():
-    if "СЮДА" in TELEGRAM_TOKEN or "СЮДА" in TELEGRAM_CHAT_ID:
-        log.error("Не заданы TELEGRAM_TOKEN / TELEGRAM_CHAT_ID")
+    missing = []
+    if not TELEGRAM_TOKEN or "СЮДА" in TELEGRAM_TOKEN:
+        missing.append("TELEGRAM_TOKEN")
+    if not TELEGRAM_CHAT_ID or "СЮДА" in TELEGRAM_CHAT_ID:
+        missing.append("TELEGRAM_CHAT_ID")
+    if missing:
+        log.error("Не заданы: %s", ", ".join(missing))
+        seen = [k for k in os.environ
+                if any(w in k.upper() for w in ("TELE", "CHAT", "TOKEN"))]
+        log.error("Похожие переменные в окружении: %s", seen or "нет")
         return
 
     conn = aiohttp.TCPConnector(limit=20, ttl_dns_cache=300)
     async with aiohttp.ClientSession(connector=conn) as session:
-        await refresh_levels(session)
-        if not levels:
-            log.error("Уровни не рассчитаны, выходим")
-            return
+        # Keepalive поднимаем первым: Render должен увидеть открытый порт сразу
+        await keepalive_server()
 
-        await send_telegram(
-            session,
-            f"<b>EQ Scanner запущен</b>\n"
-            f"Символов: {len(levels)}\n"
-            f"EQ: {KLINE_INTERVAL.upper()}, pivot {PIVOT_LEFT}/{PIVOT_RIGHT}",
-        )
+        await refresh_levels(session)
+
+        if levels:
+            await send_telegram(
+                session,
+                f"<b>EQ Scanner запущен</b>\n"
+                f"Символов: {len(levels)}\n"
+                f"EQ: {KLINE_INTERVAL.upper()}, pivot {PIVOT_LEFT}/{PIVOT_RIGHT}",
+            )
+        else:
+            log.error(
+                "Уровни не рассчитаны (IP заблокирован или нет данных). "
+                "Сервис остаётся живым, следующая попытка через час."
+            )
+            await send_telegram(
+                session,
+                "<b>EQ Scanner: уровни не рассчитаны</b>\n"
+                "Binance не отдал данные с этого IP. Повтор через час.",
+            )
 
         await asyncio.gather(
             ws_loop(session),
             refresh_scheduler(session),
             telegram_worker(session),
+            retry_until_ready(session),
         )
 
 

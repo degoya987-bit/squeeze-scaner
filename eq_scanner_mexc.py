@@ -67,6 +67,10 @@ STATE_DIR = os.getenv("STATE_DIR", _here)
 SYMBOLS_CACHE = os.path.join(STATE_DIR, "mexc_symbols_cache.json")
 STATE_FILE = os.path.join(STATE_DIR, "mexc_eq_state.json")
 
+# Источник цен: auto (WS, при сбое REST) | ws | rest
+FEED_MODE = os.getenv("FEED_MODE", "auto").lower()
+REST_POLL_SEC = int(os.getenv("REST_POLL_SEC", "10"))
+
 # HTTP-эндпоинт: на Render нужен (Web Service + UptimeRobot)
 ENABLE_HTTP = os.getenv("ENABLE_HTTP", "1") == "1"
 HTTP_PORT = int(os.getenv("PORT", "10000"))
@@ -81,6 +85,13 @@ INTERVAL_SECONDS = {
     "Day1": 86400, "Week1": 604800, "Month1": 2592000,
 }
 
+# Некоторые точки MEXC стоят за анти-бот фильтром и режут запросы
+# без внятного User-Agent. Для публичных данных это обычная практика.
+WS_HEADERS = {
+    "User-Agent": "eq-scanner/1.0 (+aiohttp)",
+    "Origin": "https://futures.mexc.com",
+}
+
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s  %(levelname)-7s  %(message)s",
@@ -89,6 +100,8 @@ logging.basicConfig(
 log = logging.getLogger("eq-mexc")
 
 ban_flag = {"until": 0.0}
+# last_msg — время последнего тика из WS, source — что реально питает бота
+feed = {"last_msg": 0.0, "source": "none", "ws_fails": 0}
 
 
 # ============================================================
@@ -454,6 +467,73 @@ async def telegram_worker(session: aiohttp.ClientSession):
 
 
 # ============================================================
+# REST-ФИД (запасной источник цен)
+# ============================================================
+
+async def fetch_all_tickers(session: aiohttp.ClientSession):
+    """Один запрос — цены всех контрактов. Лимит MEXC: 10 / 2 сек."""
+    url = f"{REST_BASE}/api/v1/contract/ticker"
+    try:
+        async with session.get(url, timeout=aiohttp.ClientTimeout(total=20)) as r:
+            if r.status in (403, 451):
+                ban_flag["until"] = time.time() + 600
+                log.error("REST-тикеры заблокированы (%s)", r.status)
+                return None
+            if r.status == 429:
+                log.warning("REST-тикеры: 429, пауза 10s")
+                await asyncio.sleep(10)
+                return None
+            r.raise_for_status()
+            body = await r.json()
+    except asyncio.CancelledError:
+        raise
+    except Exception as e:
+        log.debug("REST-тикеры: %s", e)
+        return None
+
+    if not body.get("success", False):
+        return None
+    data = body.get("data")
+    if isinstance(data, dict):
+        data = [data]
+    return data if isinstance(data, list) else None
+
+
+async def rest_poll_loop(session: aiohttp.ClientSession):
+    """
+    Опрашивает цены по REST. В режиме auto работает только тогда,
+    когда WebSocket молчит дольше 30 секунд.
+    """
+    if FEED_MODE == "ws":
+        return
+
+    while True:
+        await asyncio.sleep(REST_POLL_SEC)
+
+        if FEED_MODE == "auto" and time.time() - feed["last_msg"] < 30:
+            continue
+        if time.time() < ban_flag["until"]:
+            continue
+
+        data = await fetch_all_tickers(session)
+        if not data:
+            continue
+
+        if feed["source"] != "rest":
+            log.info("Источник цен: REST-опрос раз в %ss", REST_POLL_SEC)
+        feed["source"] = "rest"
+
+        for t in data:
+            sym = t.get("symbol")
+            price = t.get("lastPrice")
+            if sym and price is not None:
+                try:
+                    check_cross(sym, float(price))
+                except Exception as e:
+                    log.debug("check_cross %s: %s", sym, e)
+
+
+# ============================================================
 # WEBSOCKET
 # ============================================================
 
@@ -499,6 +579,10 @@ def handle_ws_payload(raw: str):
         return
     if msg.get("channel") != "push.tickers":
         return
+    feed["last_msg"] = time.time()
+    if feed["source"] != "ws":
+        log.info("Источник цен: WebSocket")
+        feed["source"] = "ws"
     data = msg.get("data")
     if not isinstance(data, list):
         return
@@ -523,12 +607,18 @@ async def ws_ping(ws):
 
 
 async def ws_loop(session: aiohttp.ClientSession):
+    if FEED_MODE == "rest":
+        log.info("FEED_MODE=rest — WebSocket не используется")
+        return
+
     backoff = 1
     while True:
         ping_task = None
         try:
             async with session.ws_connect(
-                WS_URL, timeout=aiohttp.ClientTimeout(total=None)
+                WS_URL,
+                headers=WS_HEADERS,
+                timeout=aiohttp.ClientTimeout(total=None),
             ) as ws:
                 await ws.send_json({
                     "method": "sub.tickers",
@@ -537,6 +627,7 @@ async def ws_loop(session: aiohttp.ClientSession):
                 })
                 log.info("WebSocket подключен, подписка sub.tickers отправлена")
                 backoff = 1
+                feed["ws_fails"] = 0
                 ping_task = asyncio.create_task(ws_ping(ws))
 
                 while True:
@@ -564,15 +655,25 @@ async def ws_loop(session: aiohttp.ClientSession):
             raise
         except asyncio.TimeoutError:
             log.warning("WebSocket молчит 60с — переподключаюсь")
+            feed["ws_fails"] += 1
         except Exception as e:
-            log.warning("WebSocket оборвался: %s", e)
+            feed["ws_fails"] += 1
+            txt = str(e)
+            if "403" in txt or "401" in txt:
+                # отказ на рукопожатии: биржа не пускает с этого IP,
+                # частить бесполезно — ждём дольше, цены идут через REST
+                backoff = max(backoff, 300)
+                if feed["ws_fails"] in (1, 5) or feed["ws_fails"] % 20 == 0:
+                    log.warning("WebSocket отклонён (%s), попытка №%s. "
+                                "Цены берутся по REST.", txt[:60], feed["ws_fails"])
+            else:
+                log.warning("WebSocket оборвался: %s", e)
         finally:
             if ping_task:
                 ping_task.cancel()
 
-        log.info("Переподключение через %ss", backoff)
         await asyncio.sleep(backoff)
-        backoff = min(backoff * 2, 60)
+        backoff = min(backoff * 2, 600)
 
 
 # ============================================================
@@ -626,6 +727,8 @@ async def keepalive_server():
             f"interval: {KLINE_INTERVAL}\n"
             f"pivot: {PIVOT_LEFT}/{PIVOT_RIGHT}\n"
             f"ban_left: {ban_left}s\n"
+            f"feed: {feed['source']}\n"
+            f"ws_fails: {feed['ws_fails']}\n"
         )
         return aiohttp.web.Response(text=body, content_type="text/plain")
 
@@ -695,6 +798,7 @@ async def main():
 
         tasks = [
             asyncio.create_task(ws_loop(session)),
+            asyncio.create_task(rest_poll_loop(session)),
             asyncio.create_task(refresh_scheduler(session)),
             asyncio.create_task(telegram_worker(session)),
             asyncio.create_task(retry_until_ready(session)),

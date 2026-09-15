@@ -87,10 +87,27 @@ INTERVAL_SECONDS = {
 
 # Некоторые точки MEXC стоят за анти-бот фильтром и режут запросы
 # без внятного User-Agent. Для публичных данных это обычная практика.
-WS_HEADERS = {
-    "User-Agent": "eq-scanner/1.0 (+aiohttp)",
+# MEXC стоит за Cloudflare, который часто режет запросы с дефолтным
+# User-Agent питона. Для публичных рыночных данных подставить обычный
+# браузерный UA — стандартная практика.
+UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+      "(KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36")
+
+REST_HEADERS = {
+    "User-Agent": UA,
+    "Accept": "application/json",
+    "Accept-Language": "en-US,en;q=0.9",
+    "Referer": "https://futures.mexc.com/",
     "Origin": "https://futures.mexc.com",
 }
+
+WS_HEADERS = {
+    "User-Agent": UA,
+    "Origin": "https://futures.mexc.com",
+}
+
+# Самоназначенная пауза после 403/451. Это НАШ таймер, не срок от биржи.
+BLOCK_PENALTY_SEC = int(os.getenv("BLOCK_PENALTY_SEC", "600"))
 
 logging.basicConfig(
     level=logging.INFO,
@@ -102,6 +119,18 @@ log = logging.getLogger("eq-mexc")
 ban_flag = {"until": 0.0}
 # last_msg — время последнего тика из WS, source — что реально питает бота
 feed = {"last_msg": 0.0, "source": "none", "ws_fails": 0}
+
+
+async def log_block(r, where: str):
+    """Печатает, что именно вернул сервер при отказе — Cloudflare или MEXC."""
+    try:
+        body = (await r.text())[:300].replace("\n", " ")
+    except Exception:
+        body = "(тело не прочиталось)"
+    server = r.headers.get("Server", "?")
+    ray = r.headers.get("CF-RAY", "-")
+    log.error("%s: HTTP %s | Server=%s CF-RAY=%s | %s",
+              where, r.status, server, ray, body)
 
 
 # ============================================================
@@ -215,7 +244,8 @@ async def fetch_symbols_api(session: aiohttp.ClientSession) -> list[str]:
     url = f"{REST_BASE}/api/v1/contract/detail"
     async with session.get(url, timeout=aiohttp.ClientTimeout(total=30)) as r:
         if r.status in (403, 451):
-            ban_flag["until"] = time.time() + 3600
+            await log_block(r, "contract/detail")
+            ban_flag["until"] = time.time() + BLOCK_PENALTY_SEC
             raise RuntimeError(f"Доступ заблокирован ({r.status})")
         if r.status == 429:
             ban_flag["until"] = time.time() + 300
@@ -298,7 +328,8 @@ async def fetch_klines(
                     url, params=params, timeout=aiohttp.ClientTimeout(total=20)
                 ) as r:
                     if r.status in (403, 451):
-                        ban_flag["until"] = time.time() + 3600
+                        await log_block(r, f"kline/{symbol}")
+                        ban_flag["until"] = time.time() + BLOCK_PENALTY_SEC
                         log.error("Доступ заблокирован (%s) — пересчёт прерван", r.status)
                         return None
                     if r.status == 429:
@@ -476,8 +507,8 @@ async def fetch_all_tickers(session: aiohttp.ClientSession):
     try:
         async with session.get(url, timeout=aiohttp.ClientTimeout(total=20)) as r:
             if r.status in (403, 451):
-                ban_flag["until"] = time.time() + 600
-                log.error("REST-тикеры заблокированы (%s)", r.status)
+                await log_block(r, "contract/ticker")
+                ban_flag["until"] = time.time() + BLOCK_PENALTY_SEC
                 return None
             if r.status == 429:
                 log.warning("REST-тикеры: 429, пауза 10s")
@@ -696,7 +727,7 @@ async def refresh_scheduler(session: aiohttp.ClientSession):
 
 async def retry_until_ready(session: aiohttp.ClientSession):
     while True:
-        await asyncio.sleep(3600)
+        await asyncio.sleep(max(BLOCK_PENALTY_SEC, 300))
         if levels:
             continue
         log.info("Повторная попытка пересчёта EQ")
@@ -775,7 +806,7 @@ async def main():
             pass
 
     conn = aiohttp.TCPConnector(limit=20, ttl_dns_cache=300)
-    async with aiohttp.ClientSession(connector=conn) as session:
+    async with aiohttp.ClientSession(connector=conn, headers=REST_HEADERS) as session:
         if ENABLE_HTTP:
             await keepalive_server()
 
@@ -789,11 +820,12 @@ async def main():
                 f"EQ: {KLINE_INTERVAL}, pivot {PIVOT_LEFT}/{PIVOT_RIGHT}",
             )
         else:
-            log.error("Уровни не рассчитаны. Повтор через час.")
+            log.error("Уровни не рассчитаны. Повтор через %s мин.",
+                      BLOCK_PENALTY_SEC // 60)
             await send_telegram(
                 session,
                 "<b>MEXC EQ Scanner: уровни не рассчитаны</b>\n"
-                "Биржа не отдала данные. Повтор через час.",
+                f"Биржа не отдала данные. Повтор через {BLOCK_PENALTY_SEC // 60} мин.",
             )
 
         tasks = [

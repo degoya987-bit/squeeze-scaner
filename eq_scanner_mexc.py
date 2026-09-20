@@ -63,6 +63,20 @@ MIN_TIER = int(os.getenv("MIN_TIER", "1"))            # 1 / 2 / 3
 DEADBAND_PCT = float(os.getenv("DEADBAND_PCT", "0.05"))
 SYMBOL_COOLDOWN_MIN = int(os.getenv("SYMBOL_COOLDOWN_MIN", "30"))
 
+# --- Исключение акций / TradFi ---
+# MEXC называет их вразнобой (AAPLSTOCK_USDT, NVIDIA_USDT, TESLA_USDT),
+# поэтому фильтруем по тегам сектора conceptPlate, а не по имени.
+EXCLUDE_TRADFI = os.getenv("EXCLUDE_TRADFI", "1") == "1"
+EXCLUDE_TAGS = [t.strip().lower() for t in os.getenv(
+    "EXCLUDE_TAGS",
+    "tradfi,stock,commodities,metals,forex,indices,etf"
+).split(",") if t.strip()]
+# Ручные списки: подстроки в имени символа, через запятую
+EXCLUDE_SYMBOLS = [s.strip().upper() for s in
+                   os.getenv("EXCLUDE_SYMBOLS", "").split(",") if s.strip()]
+KEEP_SYMBOLS = [s.strip().upper() for s in
+                os.getenv("KEEP_SYMBOLS", "").split(",") if s.strip()]
+
 # --- Прочее ---
 SYMBOLS_TTL_DAYS = int(os.getenv("SYMBOLS_TTL_DAYS", "15"))
 # Лимит MEXC на klines: 20 запросов / 2 сек = 10/сек.
@@ -318,10 +332,51 @@ def compute_levels(times, highs, lows, closes):
 # СПИСОК КОНТРАКТОВ
 # ============================================================
 
+def filter_signature() -> str:
+    """Меняется при правке фильтра — тогда кэш считается устаревшим."""
+    return "|".join([
+        "1" if EXCLUDE_TRADFI else "0",
+        ",".join(EXCLUDE_TAGS),
+        ",".join(EXCLUDE_SYMBOLS),
+        ",".join(KEEP_SYMBOLS),
+    ])
+
+
+def is_excluded(contract) -> str:
+    """Возвращает причину исключения или пустую строку."""
+    sym = str(contract.get("symbol", "")).upper()
+
+    for pat in KEEP_SYMBOLS:
+        if pat in sym:
+            return ""
+
+    for pat in EXCLUDE_SYMBOLS:
+        if pat in sym:
+            return f"список EXCLUDE_SYMBOLS ({pat})"
+
+    if not EXCLUDE_TRADFI:
+        return ""
+
+    for plate in (contract.get("conceptPlate") or []):
+        pl = str(plate).lower()
+        for tag in EXCLUDE_TAGS:
+            if tag in pl:
+                return f"тег {plate}"
+
+    # По документации: typeLabel 1 = TradFi, 2 = stock
+    if contract.get("typeLabel") in (1, 2):
+        return f"typeLabel={contract.get('typeLabel')}"
+
+    return ""
+
+
 def read_symbols_cache():
     try:
         with open(SYMBOLS_CACHE) as f:
             raw = json.load(f)
+        if raw.get("filter") != filter_signature():
+            log.info("Фильтр символов изменился — кэш сброшен")
+            return [], 0.0
         return raw.get("symbols", []), float(raw.get("fetched_at", 0))
     except FileNotFoundError:
         return [], 0.0
@@ -334,7 +389,8 @@ def write_symbols_cache(symbols):
     try:
         tmp = SYMBOLS_CACHE + ".tmp"
         with open(tmp, "w") as f:
-            json.dump({"fetched_at": time.time(), "symbols": symbols}, f)
+            json.dump({"fetched_at": time.time(), "symbols": symbols,
+                       "filter": filter_signature()}, f)
         os.replace(tmp, SYMBOLS_CACHE)
     except Exception as e:
         log.warning("Не удалось записать кэш символов: %s", e)
@@ -357,10 +413,26 @@ async def fetch_symbols_api(session):
         raise RuntimeError(f"MEXC вернул ошибку: {body.get('code')}")
 
     out = []
+    dropped = []
     for c in body.get("data", []):
-        if (c.get("futureType") == 1 and c.get("quoteCoin") == "USDT"
+        if not (c.get("futureType") == 1 and c.get("quoteCoin") == "USDT"
                 and c.get("state") == 0):
+            continue
+        reason = is_excluded(c)
+        if reason:
+            dropped.append((c["symbol"], reason))
+        else:
             out.append(c["symbol"])
+
+    if dropped:
+        log.info("Исключено не-крипто: %s шт", len(dropped))
+        # печатаем весь список, чтобы можно было проверить и подправить теги
+        for i in range(0, len(dropped), 8):
+            log.info("  " + " | ".join(f"{s} [{r}]" for s, r in dropped[i:i + 8]))
+    elif EXCLUDE_TRADFI:
+        log.warning("Фильтр TradFi включён, но ничего не отсеяно — "
+                    "проверь EXCLUDE_TAGS")
+
     return sorted(out)
 
 
@@ -917,6 +989,7 @@ async def keepalive_server():
             f"lookback: M{LOOKBACK_M} W{LOOKBACK_W}\n"
             f"compression: R240 {n_r} / S240 {n_s}\n"
             f"min_tier: {MIN_TIER}\n"
+            f"exclude_tradfi: {EXCLUDE_TRADFI}  tags: {','.join(EXCLUDE_TAGS)}\n"
             f"feed: {feed['source']}  ws_fails: {feed['ws_fails']}\n"
             f"ban_left: {ban_left}s\n"
             f"alerts: long {stats['long']} short {stats['short']} | "
@@ -952,6 +1025,8 @@ async def main():
              "лонг %s шорт %s | мин.тир %s",
              EQ_INTERVAL, PIVOT_LEFT, PIVOT_RIGHT, LOOKBACK_M, LOOKBACK_W,
              CONV_MULT, ATR_LEN, ENABLE_LONG, ENABLE_SHORT, MIN_TIER)
+    log.info("Фильтр не-крипто: %s | теги: %s",
+             "вкл" if EXCLUDE_TRADFI else "выкл", ", ".join(EXCLUDE_TAGS))
     levels.update(load_state())
 
     stop = asyncio.Event()
